@@ -16,10 +16,13 @@ Lock Alpha
 """
 
 blend_modes = (
-    ('SIMPLE', "Simple Ink", ""),
-    ('ALPHA', "Alpha Compositing", ""),
-    ('COPY', "Copy Alpha+Color", ""),
-    ('LOCK', "Lock Alpha", ""))
+    ('SIMPLE', "Simple Ink", ( 
+        "If the foreground color is opaque (alpha = 1), it paints with the given opaque color. "
+        "If the color has alpha (0 < alpha < 1), it composite the color with the layer surface. "
+        "If the color is transparent (alpha = 0), the tool acts like an Eraser")),
+    ('ALPHA', "Alpha Compositing", "It merges the foreground color with the layer surface depending on the alpha value of the foreground color"),
+    ('COPY', "Copy Alpha+Color", "It replaces the layer surface pixels with the active foreground color with its alpha value. It doesn't make any kind of alpha compositing, it just takes the active color and put it exactly as it is in the destination pixel"),
+    ('LOCK', "Lock Alpha", "In this case the original alpha values from the layer surface are kept, and only the RGB color components are replaced from the foreground color"))
 
 brush_shapes = (
     ('ROUND', "Round", ""),
@@ -66,17 +69,21 @@ def line(x1,y1,x2,y2):
             
             yield x, y
 
-def draw_replace(img:bpy.types.Image, dots:Generator[Tuple[int, int], None, None], color:Collection[float]):
+def draw_replace(img:bpy.types.Image, dots:Generator[Tuple[int, int], None, None], color:Collection[float], *, replace_alpha=True):
     pix = img.pixels
     for x, y in dots:
         addr = 4 * (img.size[0] * y + x)
         pix[addr + 0] = color[0]
         pix[addr + 1] = color[1]
         pix[addr + 2] = color[2]
-        pix[addr + 3] = color[3]
+        if replace_alpha:
+            pix[addr + 3] = color[3]
 
 
 def draw_alpha(img:bpy.types.Image, dots:Generator[Tuple[int, int], None, None], color:Collection[float]):
+    if color[3] == 0: 
+        return
+
     pix = img.pixels
     for x, y in dots:
         addr = 4 * (img.size[0] * y + x)
@@ -88,6 +95,16 @@ def draw_alpha(img:bpy.types.Image, dots:Generator[Tuple[int, int], None, None],
         pix[addr + 1] = (pix[addr + 1] * a + color[1] * da) / outa
         pix[addr + 2] = (pix[addr + 2] * a + color[2] * da) / outa
         pix[addr + 3] = outa
+
+
+def draw_simple(img:bpy.types.Image, dots:Generator[Tuple[int, int], None, None], color:Collection[float]):
+    if color[3] == 1.0:
+        draw_replace(img, dots, color, replace_alpha=True)
+    elif color[3] == 0.0:
+        # zero alpha non-zero rgb tends to cause weird issues when rendering/gamengines/etc
+        draw_replace(img, dots, (0, 0, 0, 0), replace_alpha=True)
+    else:
+        draw_alpha(img, dots, color)
 
 
 def _draw_callback_px(self, context):
@@ -112,8 +129,9 @@ class SB_OT_pencil(bpy.types.Operator):
     fg: bpy.props.FloatVectorProperty(
         name="Color", 
         description="Foreground Color (left click)", 
-        size = 4, 
+        size=4, 
         subtype='COLOR',
+        default=(0.8, 0.8, 0.8, 1.0),
         min=0.0,
         max=1.0)
 
@@ -125,8 +143,9 @@ class SB_OT_pencil(bpy.types.Operator):
     bg: bpy.props.FloatVectorProperty(
         name="Background", 
         description="Background Color (right click)", 
-        size = 4, 
+        size=4, 
         subtype='COLOR',
+        default=(0.2, 0.2, 0.2, 1.0),
         min=0.0,
         max=1.0)
 
@@ -136,8 +155,10 @@ class SB_OT_pencil(bpy.types.Operator):
         items=blend_modes)
 
     size: bpy.props.IntProperty(name="Size", 
-        description="Brush diameter", 
-        min=1)
+        description="Brush diameter",
+        default=1,
+        min=1,
+        max=8) # bigger than that is slow - use the default brush
 
     shape: bpy.props.EnumProperty(
         name="Shape", 
@@ -187,11 +208,7 @@ class SB_OT_pencil(bpy.types.Operator):
 
 
     def modal(self, context, event:bpy.types.Event):
-        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
-            # allow navigation
-            return {'PASS_THROUGH'}
-        
-        elif event.type == 'MOUSEMOVE':
+        if event.type == 'MOUSEMOVE':
             location_uv, uvs, verts = self.cast_ray(context, event)
             if location_uv is None:
                 self.brush = []
@@ -215,7 +232,16 @@ class SB_OT_pencil(bpy.types.Operator):
                     x0, y0 = self.last_px
                     if x0 != x or y0 != y:
                         color = self.bg if self.draw_with_bg else self.fg
-                        draw_replace(self.image, line(x0, y0, x, y), color)
+                        mode = self.bg_mode if self.draw_with_bg else self.fg_mode
+
+                        if mode == 'SIMPLE':
+                            draw_simple(self.image, line(x0, y0, x, y), color)
+                        elif mode == 'ALPHA':
+                            draw_alpha(self.image, line(x0, y0, x, y), color)
+                        elif mode == 'COPY':
+                            draw_replace(self.image, line(x0, y0, x, y), color, replace_alpha=True)
+                        elif mode == 'LOCK':
+                            draw_replace(self.image, line(x0, y0, x, y), color, replace_alpha=False)
                         self.image.update()
                         self.image.update_tag()
                         self.last_px = x, y
@@ -273,11 +299,8 @@ class SB_WT_Pencil(bpy.types.WorkSpaceTool):
     bl_label = "Pencil"
     bl_description = "Draw image pixels"
     bl_keymap = (
-        ("pribambase.draw_with_pencil", {"type": 'LEFTMOUSE', "value": 'PRESS'},
-         {"properties": []}),
-        ("pribambase.draw_with_pencil", {"type": 'RIGHTMOUSE', "value": 'PRESS'},
-         {"properties": [("draw_with_bg", True)]}),
-    )
+        ("pribambase.draw_with_pencil", {"type": 'LEFTMOUSE', "value": 'PRESS'}, None),
+        ("pribambase.draw_with_pencil", {"type": 'RIGHTMOUSE', "value": 'PRESS'}, {"properties": [("draw_with_bg", True)]}))
 
     def draw_settings(context, layout, tool):
         props = tool.operator_properties("pribambase.draw_with_pencil")
